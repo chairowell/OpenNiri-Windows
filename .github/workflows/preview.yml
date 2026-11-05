@@ -1,0 +1,137 @@
+name: Preview
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-pc-windows-gnu
+
+concurrency:
+  group: preview
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install MinGW (GNU linker)
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Add MinGW to PATH
+        shell: pwsh
+        run: |
+          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust GNU toolchain
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-preview-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-preview-
+
+      - name: Build release binaries
+        run: cargo build --locked --release --workspace --target ${{ env.TARGET }}
+
+      - name: Package preview
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = (git rev-parse HEAD).Trim()
+          $binDir = "target/$env:TARGET/release"
+
+          New-Item -ItemType Directory -Force -Path bundle | Out-Null
+          foreach ($exe in 'openniri.exe', 'openniri-cli.exe') {
+            $path = Join-Path $binDir $exe
+            if (-not (Test-Path $path)) { throw "Missing build output: $path" }
+            Copy-Item $path bundle/
+          }
+          Copy-Item README.md, CHANGELOG.md, LICENSE bundle/
+          Compress-Archive -Path bundle/* -DestinationPath openniri-windows-preview.zip -Force
+
+          $hashed = @('openniri-windows-preview.zip') + (Get-ChildItem bundle -File | ForEach-Object { $_.FullName })
+          $lines = foreach ($file in $hashed) {
+            $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
+            "$hash  $(Split-Path $file -Leaf)"
+          }
+          $lines | Out-File -FilePath checksums.txt -Encoding utf8
+
+          $remotePreview = git ls-remote origin refs/tags/preview
+          if ($LASTEXITCODE -ne 0) { throw 'Could not check the existing preview tag.' }
+          $previous = $null
+          if ($remotePreview) {
+            git fetch origin refs/tags/preview:refs/tags/preview
+            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch the previous preview tag.' }
+            $previous = (git rev-parse 'refs/tags/preview^{commit}').Trim()
+            if ($LASTEXITCODE -ne 0) { throw 'Could not resolve the previous preview commit.' }
+          }
+
+          $notes = [System.Collections.Generic.List[string]]::new()
+          $notes.Add('## Build date')
+          $notes.Add('')
+          $notes.Add("$([DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm')) UTC")
+          $notes.Add('')
+          $notes.Add("Commit: [$($sha.Substring(0, 7))](https://github.com/${{ github.repository }}/commit/$sha)")
+          $notes.Add('')
+          $notes.Add('## Updates since the previous preview')
+          $notes.Add('')
+
+          $range = if ($previous) { "$previous..$sha" } else { $sha }
+          $commits = git log --format='%H%x09%s' $range
+          if ($LASTEXITCODE -ne 0) { throw 'Could not generate the preview commit list.' }
+          if ($previous -and $previous -eq $sha) {
+            $notes.Add('No new commits since the previous preview.')
+          } elseif (-not $commits) {
+            $notes.Add('No commits found.')
+          } else {
+            foreach ($commit in $commits) {
+              $parts = $commit -split "`t", 2
+              $notes.Add("- [$($parts[0].Substring(0, 7))](https://github.com/${{ github.repository }}/commit/$($parts[0])) $($parts[1])")
+            }
+          }
+          $notes | Out-File -FilePath preview-notes.md -Encoding utf8
+
+          git tag -f preview $sha
+          if ($LASTEXITCODE -ne 0) { throw 'Could not update the preview tag locally.' }
+          git push origin refs/tags/preview --force
+          if ($LASTEXITCODE -ne 0) { throw 'Could not push the updated preview tag.' }
+
+      - name: Publish preview release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          tag_name: preview
+          name: Preview (latest main)
+          body_path: preview-notes.md
+          prerelease: true
+          make_latest: false
+          files: |
+            openniri-windows-preview.zip
+            checksums.txt
+            bundle/openniri.exe
+            bundle/openniri-cli.exe
+          fail_on_unmatched_files: true

@@ -42,52 +42,6 @@ jobs:
           toolchain: stable-x86_64-pc-windows-gnu
           components: rustfmt, clippy
 
-      - name: Validate release metadata (tag/version/changelog)
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z\.-]+)?)$') {
-            throw "Tag '$tag' must match v<semver> (example: v0.1.0 or v0.1.0-alpha.1)."
-          }
-          $tagVersion = $Matches['version']
-
-          $cargoToml = Get-Content -Raw Cargo.toml
-          $workspaceSection = [regex]::Match($cargoToml, '(?ms)^\[workspace\.package\]\s*(?<body>.*?)(^\[|\z)')
-          if (-not $workspaceSection.Success) {
-            throw "Could not find [workspace.package] section in Cargo.toml."
-          }
-          $versionMatch = [regex]::Match($workspaceSection.Groups['body'].Value, '(?m)^\s*version\s*=\s*"(?<version>[^"]+)"\s*$')
-          if (-not $versionMatch.Success) {
-            throw "Could not find workspace version in Cargo.toml."
-          }
-          $cargoVersion = $versionMatch.Groups['version'].Value
-
-          if ($tagVersion -ne $cargoVersion) {
-            throw "Tag version '$tagVersion' does not match Cargo.toml workspace version '$cargoVersion'."
-          }
-
-          $escapedVersion = [regex]::Escape($tagVersion)
-          $changelog = Get-Content -Raw CHANGELOG.md
-          $changelogPattern = "(?m)^##\s+\[$escapedVersion\](?:\s+-\s+.*)?$"
-          if ($changelog -notmatch $changelogPattern) {
-            throw "CHANGELOG.md must contain a release heading '## [$tagVersion]' before tagging."
-          }
-
-          Write-Host "Release metadata checks passed for $tag."
-
-      - name: Enforce tag is main HEAD
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
-        run: |
-          git fetch origin main --depth=1
-          $mainHead = (git rev-parse origin/main).Trim()
-          $tagCommit = (git rev-parse HEAD).Trim()
-          if ($tagCommit -ne $mainHead) {
-            throw "Release blocked: tag commit ($tagCommit) is not the current origin/main HEAD ($mainHead)."
-          }
-          Write-Host "Tag commit matches origin/main HEAD."
-
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -101,6 +55,16 @@ jobs:
 
       - name: Build
         run: cargo build --locked --all --verbose
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: openniri-ci-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/x86_64-pc-windows-gnu/debug/openniri.exe
+            target/x86_64-pc-windows-gnu/debug/openniri-cli.exe
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Run tests
         run: cargo test --locked --all --verbose
@@ -125,140 +89,3 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit
-
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: windows-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install MinGW (GNU linker)
-        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
-        with:
-          update: true
-          install: mingw-w64-x86_64-gcc
-
-      - name: Add MinGW to PATH
-        shell: pwsh
-        run: |
-          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Install Rust GNU toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-        with:
-          toolchain: stable-x86_64-pc-windows-gnu
-
-      - name: Validate release metadata (tag/version/changelog)
-        shell: pwsh
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v(?<version>[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z\.-]+)?)$') {
-            throw "Tag '$tag' must match v<semver> (example: v0.1.0 or v0.1.0-alpha.1)."
-          }
-          $tagVersion = $Matches['version']
-
-          $cargoToml = Get-Content -Raw Cargo.toml
-          $workspaceSection = [regex]::Match($cargoToml, '(?ms)^\[workspace\.package\]\s*(?<body>.*?)(^\[|\z)')
-          if (-not $workspaceSection.Success) {
-            throw "Could not find [workspace.package] section in Cargo.toml."
-          }
-          $versionMatch = [regex]::Match($workspaceSection.Groups['body'].Value, '(?m)^\s*version\s*=\s*"(?<version>[^"]+)"\s*$')
-          if (-not $versionMatch.Success) {
-            throw "Could not find workspace version in Cargo.toml."
-          }
-          $cargoVersion = $versionMatch.Groups['version'].Value
-
-          if ($tagVersion -ne $cargoVersion) {
-            throw "Tag version '$tagVersion' does not match Cargo.toml workspace version '$cargoVersion'."
-          }
-
-          $escapedVersion = [regex]::Escape($tagVersion)
-          $changelog = Get-Content -Raw CHANGELOG.md
-          $changelogPattern = "(?m)^##\s+\[$escapedVersion\](?:\s+-\s+.*)?$"
-          if ($changelog -notmatch $changelogPattern) {
-            throw "CHANGELOG.md must contain a release heading '## [$tagVersion]' before tagging."
-          }
-
-          Write-Host "Release metadata checks passed for $tag."
-
-      - name: Enforce tag is main HEAD
-        shell: pwsh
-        run: |
-          git fetch origin main --depth=1
-          $mainHead = (git rev-parse origin/main).Trim()
-          $tagCommit = (git rev-parse HEAD).Trim()
-          if ($tagCommit -ne $mainHead) {
-            throw "Release blocked: tag commit ($tagCommit) is not the current origin/main HEAD ($mainHead)."
-          }
-          Write-Host "Tag commit matches origin/main HEAD."
-
-      - name: Cache cargo registry
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-release-
-
-      - name: Build release binaries
-        run: cargo build --locked --release --all
-
-      - name: Create release archive
-        run: |
-          mkdir release
-          cp target/release/openniri.exe release/
-          cp target/release/openniri-cli.exe release/
-          cp README.md release/
-          cp LICENSE* release/ 2>$null; $true
-          Compress-Archive -Path release/* -DestinationPath openniri-windows-${{ github.ref_name }}.zip
-        shell: pwsh
-
-      - name: Generate checksums
-        run: |
-          $files = @(
-            "openniri-windows-${{ github.ref_name }}.zip",
-            "target/release/openniri.exe",
-            "target/release/openniri-cli.exe"
-          )
-          $checksums = foreach ($file in $files) {
-            $hash = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLower()
-            $name = Split-Path $file -Leaf
-            "$hash  $name"
-          }
-          $checksums | Out-File -FilePath checksums.txt -Encoding utf8
-          Write-Host "Generated checksums:"
-          Get-Content checksums.txt
-        shell: pwsh
-
-      - name: Determine pre-release status
-        id: prerelease
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if ($tag -match '-(alpha|beta|rc)') {
-            echo "is_prerelease=true" >> $env:GITHUB_OUTPUT
-          } else {
-            echo "is_prerelease=false" >> $env:GITHUB_OUTPUT
-          }
-        shell: pwsh
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
-        with:
-          files: |
-            openniri-windows-${{ github.ref_name }}.zip
-            target/release/openniri.exe
-            target/release/openniri-cli.exe
-            checksums.txt
-          generate_release_notes: true
-          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
